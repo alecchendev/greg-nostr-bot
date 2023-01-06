@@ -1,12 +1,11 @@
-use std::backtrace::BacktraceStatus;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
 use std::io::Read;
 
+use hyper::body::HttpBody;
 use hyper::client::HttpConnector;
-use hyper::header::{HeaderValue, AUTHORIZATION};
-use hyper::{Body, Client, Method, Request, Uri};
+use hyper::{Body, Client, Method, Request};
 use hyper_tls::HttpsConnector;
 
 use serde::{Deserialize, Serialize};
@@ -18,10 +17,10 @@ use std::env;
 async fn main() -> Result<(), Box<dyn Error>> {
     println!("Hello, world!");
 
-    let relays = read_relays()?;
+    let _relays = read_relays()?;
 
     let env = read_env()?;
-    let api_key = env.get("API_KEY").unwrap();
+    let _api_key = env.get("API_KEY").unwrap();
     let bearer_token = env.get("BEARER_TOKEN").unwrap();
 
     let https = HttpsConnector::new();
@@ -55,10 +54,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct TweetData {
+    edit_history_tweet_ids: Option<Vec<String>>,
+    id: String,
+    text: String,
+}
+
 async fn get_stream(
     client: &Client<HttpsConnector<HttpConnector>>,
     bearer_token: &str,
-) -> Result<Value, Box<dyn Error>> {
+) -> Result<(), Box<dyn Error>> {
     let req = Request::builder()
         .method(Method::GET)
         .uri("https://api.twitter.com/2/tweets/search/stream")
@@ -66,17 +72,44 @@ async fn get_stream(
         .header("Authorization", "Bearer ".to_owned() + bearer_token)
         .body(Body::empty())?;
 
-    let res: hyper::Response<Body> = client.request(req).await?;
+    let mut res: hyper::Response<Body> = client.request(req).await?;
 
     println!("status: {}", res.status());
 
-    let buf = hyper::body::to_bytes(res).await?;
+    while let Some(chunk) = res.body_mut().data().await {
+        let chunk = chunk?;
+        let s = String::from_utf8(chunk.to_vec())?;
+        if s.trim() == "" {
+            // println!("empty chunk");
+            continue;
+        }
+        // spawn a new thread to handle the chunk
+        tokio::spawn(async move {
+            handle_tweet(s).unwrap();
+        });
+    }
 
-    println!("body: {:?}", buf);
+    // let buf = hyper::body::to_bytes(res).await?;
 
-    let json: Value = serde_json::from_slice(&buf)?;
+    // println!("body: {:?}", buf);
 
-    Ok(json)
+    // let json: Value = serde_json::from_slice(&buf)?;
+
+    Ok(())
+}
+
+fn handle_tweet(s: String) -> Result<(), Box<dyn Error>> {
+    println!("chunk: {}", s);
+
+    let json: Value = serde_json::from_str(&s)?;
+    let data: TweetData = serde_json::from_value(json["data"].clone())?;
+
+    println!("data: {:?}", data);
+    
+    // post data.text to nostr!
+    
+
+    Ok(())
 }
 
 async fn get_stream_rules(
