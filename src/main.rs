@@ -3,9 +3,11 @@ use std::env;
 use std::error::Error;
 use std::fs::File;
 use std::io::Read;
+use std::sync::Arc;
 
 use hyper::body::HttpBody;
 use hyper::client::HttpConnector;
+use hyper::Uri;
 use hyper::{Body, Client, Method, Request};
 use hyper_tls::HttpsConnector;
 
@@ -14,18 +16,10 @@ use futures_util::sink::SinkExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
-use tokio_tungstenite::{
-    connect_async, tungstenite::Message, Connector, MaybeTlsStream, WebSocketStream,
-};
+use tokio::sync::Mutex;
+use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
-// use nostr_rust;
-use nostr_types::{Event, EventKind, PreEvent, PrivateKey, PublicKey, Unixtime};
-
-use tokio::sync::{Mutex, MutexGuard};
-
-use std::sync::Arc;
-
-use hyper::Uri;
+use nostr_types::{Event, EventKind, PreEvent, PrivateKey, Unixtime};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -41,8 +35,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let https = HttpsConnector::new();
     let client = Client::builder().build::<_, hyper::Body>(https);
 
-    let mut nostr_client = NostrClient::new().await;
-    nostr_client.add_relays(&relays).await;
+    let nostr_client = Arc::new(Mutex::new(NostrClient::new()));
+    // nostr_client.add_relays(&relays).await;
+    nostr_client
+        .lock()
+        .await
+        .add_relay(&"ws://localhost:8080".to_string())
+        .await?;
+    
+    let nostr_clone = nostr_client.clone();
 
     // Cli
     let args: Vec<String> = env::args().collect();
@@ -57,6 +58,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .await
             .and_then(|_| Ok(()))?,
         // "create_stream_rule" => create_stream_rule(&client, bearer_token).await?,
+        "post_stream" => post_stream(&client, bearer_token, nostr_clone, private_key).await?,
         "create_greg" => {
             create_only_user_stream_rule(&client, bearer_token, "greg16676935420").await?
         }
@@ -66,7 +68,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             delete_only_user_stream_rule(&client, bearer_token, "greg16676935420").await?
         }
         "delete_alec" => delete_only_user_stream_rule(&client, bearer_token, "alecchendev").await?,
-        "post" => post_note(&mut nostr_client, "Hello, nostr!", &private_key).await?,
+        "post" => post_note(nostr_client, "Hello, nostr!", private_key).await?,
         // "get_notes" => get_notes(),
         _ => println!("No command found"),
     };
@@ -74,10 +76,71 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+pub struct PrivateKeyCloneable {
+    pub private_key: PrivateKey,
+}
+
+impl PrivateKeyCloneable {
+    pub fn new(private_key: PrivateKey) -> Self {
+        Self { private_key }
+    }
+    fn clone(&mut self) -> Self {
+        let hex_string = self.private_key.as_hex_string();
+        let new_private_key = PrivateKey::try_from_hex_string(&hex_string).unwrap();
+        Self {
+            private_key: new_private_key
+        }
+    }
+}
+
+async fn post_stream(
+    client: &Client<HttpsConnector<HttpConnector>>,
+    bearer_token: &String,
+    nostr_client: Arc<Mutex<NostrClient>>,
+    private_key: nostr_types::PrivateKey,
+) -> Result<(), Box<dyn Error>> {
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("https://api.twitter.com/2/tweets/search/stream")
+        .header("Content-Type", "application/json")
+        .header("Authorization", "Bearer ".to_owned() + bearer_token)
+        .body(Body::empty())?;
+
+    let mut res: hyper::Response<Body> = client.request(req).await?;
+
+    println!("status: {}", res.status());
+    let mut private_key_cloneable = PrivateKeyCloneable::new(private_key);
+
+    while let Some(chunk) = res.body_mut().data().await {
+        let chunk = chunk?;
+        let s = String::from_utf8(chunk.to_vec())?;
+        if s.trim() == "" {
+            // println!("empty chunk");
+            continue;
+        }
+
+        // get text from s
+        let v: Value = serde_json::from_str(&s)?;
+        let data: TweetData = serde_json::from_value(v["data"].clone())?;
+        println!("text from tweet: {}", data.text);
+
+        // spawn a new thread to handle the chunk
+        let private_key_clone = private_key_cloneable.clone();
+        let nostr_client_clone = nostr_client.clone();
+        tokio::spawn(async move {
+            post_note(nostr_client_clone, &data.text, private_key_clone.private_key).await.unwrap();
+        });
+    }
+
+    Ok(())
+
+}
+
 async fn post_note(
-    nostr_client: &mut NostrClient,
+    nostr_client: Arc<Mutex<NostrClient>>,
     text: &str,
-    private_key: &nostr_types::PrivateKey,
+    private_key: nostr_types::PrivateKey,
 ) -> Result<(), Box<dyn Error>> {
     let pre_event = PreEvent {
         /// The public key of the actor who is creating the event
@@ -98,9 +161,9 @@ async fn post_note(
         /// An optional verified time for the event (using OpenTimestamp)
         ots: None,
     };
-    let event = Event::new(pre_event, private_key)?;
+    let event = Event::new(pre_event, &private_key)?;
     assert!(event.verify(None).is_ok());
-    nostr_client.publish_event(&event).await?;
+    nostr_client.lock().await.publish_event(&event).await?;
     Ok(())
 }
 
@@ -109,7 +172,7 @@ struct NostrClient {
 }
 
 impl NostrClient {
-    async fn new() -> Self {
+    fn new() -> Self {
         Self {
             relays: HashMap::new(),
         }
@@ -129,7 +192,8 @@ impl NostrClient {
         let uri = url.parse::<Uri>().unwrap();
         let (ws_stream, response) = connect_async(uri).await?;
         println!("Relay: {} | connect response: {:?}", url, response);
-        self.relays.insert(url.clone(), Arc::new(Mutex::new(ws_stream)));
+        self.relays
+            .insert(url.clone(), Arc::new(Mutex::new(ws_stream)));
         Ok(())
     }
 
